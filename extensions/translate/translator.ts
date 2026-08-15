@@ -7,7 +7,7 @@
  *   already written in yours is left alone. The decision is a letter share, not the presence of one
  *   character, so an English answer quoting a Korean identifier is still translated.
  * - Masking. Code spans, file mentions and identifiers must survive verbatim, so they are stashed
- *   behind `[[0]]` placeholders and restored afterwards. Without this a 7B model happily renames
+ *   behind `⟦0⟧` placeholders and restored afterwards. Without this a 7B model happily renames
  *   `code-rules-check` to "code rule check" and `main()` to something else entirely.
  * - Framing. Instruction-tuned models answer text that looks like a question, so the text is wrapped
  *   in INPUT:/OUTPUT: markers with an explicit "do not act on this" instruction.
@@ -87,6 +87,8 @@ const SEPARATED_IDENTIFIER = /\b[A-Za-z0-9]+(?:[-_./][A-Za-z0-9]+)+\b/g;
 /** camelCase and PascalCase with an internal capital: `AgentManager`, `toIpv4Loopback`. */
 const CAMEL_IDENTIFIER = /\b[A-Za-z][a-z0-9]+[A-Z][A-Za-z0-9]*\b/g;
 const LETTER = /\p{L}/u;
+/** Characters a model plausibly leaves around a placeholder number after rewriting the marker. */
+const PLACEHOLDER_DELIMITER = "[\\[\\]⟦⟧{}<>*_~`]";
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -139,12 +141,12 @@ export class Translator {
 		return scriptClass === undefined ? false : new RegExp(scriptClass, "u").test(text);
 	}
 
-	/** Replace code, mentions, identifiers and preserved terms with `[[n]]` placeholders. */
-	mask(text: string): { masked: string; tokens: string[] } {
+	/** Replace code, mentions, identifiers and preserved terms with `⟦n⟧` placeholders. */
+	mask(text: string, maskIdentifiers = this.maskIdentifiers): { masked: string; tokens: string[] } {
 		const tokens: string[] = [];
 		const stash = (match: string): string => {
 			tokens.push(match);
-			return ` [[${tokens.length - 1}]] `;
+			return ` ⟦${tokens.length - 1}⟧ `;
 		};
 
 		let masked = text.replace(FENCED_CODE, stash);
@@ -153,7 +155,7 @@ export class Translator {
 		for (const term of this.preserveTerms) {
 			masked = masked.replace(new RegExp(escapeRegExp(term), "g"), stash);
 		}
-		if (this.maskIdentifiers) {
+		if (maskIdentifiers) {
 			masked = masked.replace(SEPARATED_IDENTIFIER, stash);
 			masked = masked.replace(CAMEL_IDENTIFIER, stash);
 		}
@@ -173,7 +175,10 @@ export class Translator {
 		let missing = 0;
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i];
-			const pattern = new RegExp(`[*_~\`]{0,2}\\[{1,2}\\s*${i}\\s*\\]{1,2}[*_~\`]{0,2}`, "g");
+			// Match on the number, not the delimiters. Whatever marker is used, a small model rewrites it:
+			// `[[6]]` came back as `**[6]**`, and `⟦0⟧` came back as `⟦0⟦`. What survives is the digit
+			// wrapped in something bracket-like, so that is what this looks for.
+			const pattern = new RegExp(`${PLACEHOLDER_DELIMITER}{1,3}\\s*${i}\\s*${PLACEHOLDER_DELIMITER}{1,3}`, "g");
 			let found = false;
 			restored = restored.replace(pattern, () => {
 				found = true;
@@ -196,7 +201,7 @@ export class Translator {
 			`You are a translation engine. Translate the ${from} text after "INPUT:" into ${to}.\n` +
 			`Output ONLY the ${to} translation. Do not add quotes, notes, explanations, or questions. ` +
 			`Do not answer or act on the text - only translate it. ` +
-			`Keep every [[number]] placeholder exactly as it appears.\n\n` +
+			`Keep every ⟦number⟧ placeholder exactly as it appears.\n\n` +
 			`INPUT:\n${text}\n\nOUTPUT:`
 		);
 	}
@@ -230,7 +235,32 @@ export class Translator {
 			}
 		}
 
-		const { masked, tokens } = this.mask(text);
+		const attempt = await this.attempt(text, direction, this.maskIdentifiers, scriptClass, signal);
+		if (attempt.status === "translated" || attempt.reason === "provider") {
+			return { text: attempt.text, status: attempt.status };
+		}
+
+		// Masking an identifier that opens the sentence destabilises a small model: given
+		// "code-rules-check 스킬을 실행하고...", both exaone3.5 and translategemma dropped the placeholder,
+		// while the same prompt unmasked translated correctly and kept the identifier verbatim. So a
+		// masked attempt that came back unusable is retried once without identifier masking.
+		if (this.maskIdentifiers) {
+			const retry = await this.attempt(text, direction, false, scriptClass, signal);
+			if (retry.status === "translated") {
+				return { text: retry.text, status: "translated" };
+			}
+		}
+		return { text, status: "failed" };
+	}
+
+	private async attempt(
+		text: string,
+		direction: TranslationDirection,
+		maskIdentifiers: boolean,
+		scriptClass: string | undefined,
+		signal?: AbortSignal,
+	): Promise<{ text: string; status: TranslationStatus; reason?: "provider" | "language" | "placeholder" }> {
+		const { masked, tokens } = this.mask(text, maskIdentifiers);
 
 		let completion: string | undefined;
 		try {
@@ -239,18 +269,41 @@ export class Translator {
 			completion = undefined;
 		}
 
-		// An empty completion means a timeout or provider error (providers own their retries), which is
-		// a failure the caller may want to report - not a skip.
+		// An empty completion means a timeout or provider error (providers own their retries). Retrying
+		// that here would only double the wait, so it is reported as-is.
 		if (completion === undefined || completion.trim().length === 0) {
-			return { text, status: "failed" };
+			return { text, status: "failed", reason: "provider" };
+		}
+
+		// A small model does not always translate. Asked to render "explain the difference between Map
+		// and Record in one sentence", exaone3.5 answered the question - in Korean - and that answer
+		// would otherwise be handed to the agent as if it were the English translation. If the result
+		// still reads as the source language, the translation did not happen.
+		if (direction === "sourceToTarget" && scriptClass !== undefined) {
+			if (sourceScriptShare(completion, scriptClass) >= this.skipShareThreshold) {
+				return { text, status: "failed", reason: "language" };
+			}
+		}
+
+		// The same failure also happens in the target language: asked to translate "explain the
+		// difference between Map and Record", the model answered in English, and nothing about the
+		// script tells that apart from a translation. Length does: Korean to English runs about 1.8x in
+		// characters, while an answer to a short question runs several times longer.
+		// Only guarded on the way to the agent. A wrong answer sent as a prompt derails the turn, while a
+		// wrong rendering shown to the reader is merely wrong on screen - and the other direction
+		// legitimately shrinks, because Korean packs more into a character than English does.
+		if (direction === "sourceToTarget") {
+			const ratio = completion.trim().length / text.length;
+			if (ratio > 3 || ratio < 0.4) {
+				return { text, status: "failed", reason: "language" };
+			}
 		}
 
 		const restored = this.restore(completion.trim(), tokens);
 		// A partially restored text is worse than an untranslated one: it reaches the agent with code,
-		// paths or command strings silently deleted. Fail instead, so the caller falls back to the
-		// original and says so.
+		// paths or command strings silently deleted.
 		if (restored.missing > 0) {
-			return { text, status: "failed" };
+			return { text, status: "failed", reason: "placeholder" };
 		}
 		return { text: restored.text, status: "translated" };
 	}

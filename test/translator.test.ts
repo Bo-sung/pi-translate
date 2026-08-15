@@ -136,7 +136,7 @@ describe("Translator", () => {
 			"targetToSource",
 		);
 		assert.notEqual(reTranslated.status, "skipped");
-		assert.equal(strict.prompts.length, 1);
+		assert.ok(strict.prompts.length >= 1);
 	});
 
 	it("still translates an English answer that quotes a Korean name", async () => {
