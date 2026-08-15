@@ -49,6 +49,12 @@ export interface TranslatorOptions {
 	 * rather than a half.
 	 */
 	skipShareThreshold?: number;
+	/**
+	 * Minimum source-script letter share for a prompt to count as yours. Below it the text is treated
+	 * as machine-generated with a few of your words in it and passed through untouched. Defaults to
+	 * 0.05, which is far below any real prompt and far above an injected agent preamble.
+	 */
+	minInputShare?: number;
 	/** Mask identifier-shaped tokens (kebab-case, snake_case, camelCase, dotted paths). */
 	maskIdentifiers?: boolean;
 	/** Exact strings to keep verbatim, e.g. product names the model would otherwise transliterate. */
@@ -103,6 +109,7 @@ export class Translator {
 	readonly targetLanguage: string;
 	private readonly generate: TranslationGenerate;
 	private readonly skipShareThreshold: number;
+	private readonly minInputShare: number;
 	private readonly maskIdentifiers: boolean;
 	private readonly preserveTerms: readonly string[];
 
@@ -111,6 +118,7 @@ export class Translator {
 		this.targetLanguage = options.targetLanguage.trim() || "English";
 		this.generate = options.generate;
 		this.skipShareThreshold = options.skipShareThreshold ?? 0.2;
+		this.minInputShare = options.minInputShare ?? 0.05;
 		this.maskIdentifiers = options.maskIdentifiers ?? true;
 		// Longest first so "Claude Code" wins over "Claude".
 		this.preserveTerms = [...(options.preserveTerms ?? [])]
@@ -152,14 +160,32 @@ export class Translator {
 		return { masked, tokens };
 	}
 
-	/** Put the stashed spans back. The replacement is a function so `$&` inside code stays literal. */
-	restore(text: string, tokens: readonly string[]): string {
+	/**
+	 * Put the stashed spans back.
+	 *
+	 * Models do not leave placeholders alone: a 7B model turned `[[6]]` into `**[6]**` across a whole
+	 * message, which silently deleted every masked span. So the pattern tolerates markdown emphasis,
+	 * spacing, and a dropped bracket level, and the caller treats any placeholder it still cannot
+	 * resolve as a failed translation. The replacement is a function so `$&` inside code stays literal.
+	 */
+	restore(text: string, tokens: readonly string[]): { text: string; missing: number } {
 		let restored = text;
+		let missing = 0;
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i];
-			restored = restored.replace(new RegExp(`\\[\\[\\s*${i}\\s*\\]\\]`, "g"), () => token);
+			const pattern = new RegExp(`[*_~\`]{0,2}\\[{1,2}\\s*${i}\\s*\\]{1,2}[*_~\`]{0,2}`, "g");
+			let found = false;
+			restored = restored.replace(pattern, () => {
+				found = true;
+				return token;
+			});
+			// Counting what came back, rather than what is left over, also catches the placeholder the
+			// model deleted outright - the case where the span vanishes without a trace.
+			if (!found) {
+				missing++;
+			}
 		}
-		return restored;
+		return { text: restored, missing };
 	}
 
 	/** Wrap the (already masked) text with the language labels for this direction. */
@@ -190,8 +216,12 @@ export class Translator {
 
 		const scriptClass = this.sourceScriptClass();
 		if (scriptClass !== undefined) {
-			// You -> agent: no source-script characters at all means you already wrote the target language.
-			if (direction === "sourceToTarget" && !new RegExp(scriptClass, "u").test(text)) {
+			// You -> agent: a text that is overwhelmingly the target language already is not a prompt of
+			// yours that needs translating - it is something machine-generated with a few words of yours
+			// in it. Orca injects a 4.7 KB English worker preamble with the task spec appended; at 1.4%
+			// Korean that was translated in full, which cost 12 seconds and corrupted the exact command
+			// strings the preamble tells the worker to run.
+			if (direction === "sourceToTarget" && sourceScriptShare(text, scriptClass) < this.minInputShare) {
 				return { text, status: "skipped" };
 			}
 			// Agent -> you: leave an answer alone once enough of it is already your language.
@@ -214,6 +244,14 @@ export class Translator {
 		if (completion === undefined || completion.trim().length === 0) {
 			return { text, status: "failed" };
 		}
-		return { text: this.restore(completion.trim(), tokens), status: "translated" };
+
+		const restored = this.restore(completion.trim(), tokens);
+		// A partially restored text is worse than an untranslated one: it reaches the agent with code,
+		// paths or command strings silently deleted. Fail instead, so the caller falls back to the
+		// original and says so.
+		if (restored.missing > 0) {
+			return { text, status: "failed" };
+		}
+		return { text: restored.text, status: "translated" };
 	}
 }

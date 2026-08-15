@@ -8,6 +8,15 @@ import { DEFAULTS, describe as describeConfig, resolveConfig } from "../extensio
 
 const tempDirs: string[] = [];
 
+/** An empty global config, so tests never depend on the machine's real one. */
+const emptyGlobal = (() => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-translate-global-"));
+	tempDirs.push(dir);
+	const path = join(dir, "translate.json");
+	writeFileSync(path, "{}", "utf8");
+	return path;
+})();
+
 function projectConfig(contents: Partial<TranslateConfig>): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-translate-test-"));
 	tempDirs.push(dir);
@@ -29,7 +38,7 @@ describe("config precedence", () => {
 	});
 
 	it("lets a project turn it on", () => {
-		const resolved = resolveConfig({ projectConfigPath: projectConfig({ enabled: true }) });
+		const resolved = resolveConfig({ globalPath: emptyGlobal, projectConfigPath: projectConfig({ enabled: true }) });
 		assert.equal(resolved.config.enabled, true);
 		assert.equal(resolved.enabledSource, "config");
 		assert.equal(resolved.locked, false);
@@ -37,41 +46,41 @@ describe("config precedence", () => {
 
 	it("lets --no-translate override a project that turned it on", () => {
 		// The worker case: the launcher cannot edit config files but can pass a flag.
-		const resolved = resolveConfig({ projectConfigPath: projectConfig({ enabled: true }), flagOff: true });
+		const resolved = resolveConfig({ globalPath: emptyGlobal, projectConfigPath: projectConfig({ enabled: true }), flagOff: true });
 		assert.equal(resolved.config.enabled, false);
 		assert.equal(resolved.enabledSource, "flag");
 		assert.equal(resolved.locked, true);
 	});
 
 	it("lets --translate override a config that left it off", () => {
-		const resolved = resolveConfig({ flagOn: true });
+		const resolved = resolveConfig({ globalPath: emptyGlobal, flagOn: true });
 		assert.equal(resolved.config.enabled, true);
 		assert.equal(resolved.enabledSource, "flag");
 	});
 
 	it("reads PI_TRANSLATE when no flag is present", () => {
 		for (const value of ["off", "0", "false", "OFF"]) {
-			assert.equal(resolveConfig({ projectConfigPath: projectConfig({ enabled: true }), env: value }).config.enabled, false);
+			assert.equal(resolveConfig({ globalPath: emptyGlobal, projectConfigPath: projectConfig({ enabled: true }), env: value }).config.enabled, false);
 		}
 		for (const value of ["on", "1", "true"]) {
-			assert.equal(resolveConfig({ env: value }).config.enabled, true);
+			assert.equal(resolveConfig({ globalPath: emptyGlobal, env: value }).config.enabled, true);
 		}
 		// Anything else falls through to the stored decision rather than guessing.
-		assert.equal(resolveConfig({ env: "maybe" }).enabledSource, "config");
+		assert.equal(resolveConfig({ globalPath: emptyGlobal, env: "maybe" }).enabledSource, "config");
 	});
 
 	it("prefers a flag over the environment", () => {
-		const resolved = resolveConfig({ env: "on", flagOff: true });
+		const resolved = resolveConfig({ globalPath: emptyGlobal, env: "on", flagOff: true });
 		assert.equal(resolved.config.enabled, false);
 		assert.equal(resolved.enabledSource, "flag");
 	});
 
 	it("only disables inside an Orca agent pane when asked to", () => {
 		const on = projectConfig({ enabled: true });
-		assert.equal(resolveConfig({ projectConfigPath: on, orcaAgent: true }).config.enabled, true);
+		assert.equal(resolveConfig({ globalPath: emptyGlobal, projectConfigPath: on, orcaAgent: true }).config.enabled, true);
 
 		const optedIn = projectConfig({ enabled: true, disableWhenOrcaAgent: true });
-		const resolved = resolveConfig({ projectConfigPath: optedIn, orcaAgent: true });
+		const resolved = resolveConfig({ globalPath: emptyGlobal, projectConfigPath: optedIn, orcaAgent: true });
 		assert.equal(resolved.config.enabled, false);
 		assert.equal(resolved.enabledSource, "orca");
 	});
@@ -81,11 +90,11 @@ describe("config precedence", () => {
 		tempDirs.push(dir);
 		const path = join(dir, "translate.json");
 		writeFileSync(path, "{ not json", "utf8");
-		assert.equal(resolveConfig({ projectConfigPath: path }).config.enabled, false);
+		assert.equal(resolveConfig({ globalPath: emptyGlobal, projectConfigPath: path }).config.enabled, false);
 	});
 
 	it("describes the active configuration in one line", () => {
-		const resolved = resolveConfig({ projectConfigPath: projectConfig({ enabled: true, ollama: { model: "exaone3.5:7.8b" } }) });
+		const resolved = resolveConfig({ globalPath: emptyGlobal, projectConfigPath: projectConfig({ enabled: true, ollama: { model: "exaone3.5:7.8b" } }) });
 		assert.equal(describeConfig(resolved.config), "Korean->English via ollama:exaone3.5:7.8b [in+out]");
 	});
 });

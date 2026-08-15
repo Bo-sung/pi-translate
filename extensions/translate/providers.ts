@@ -224,6 +224,7 @@ export function createTranslator(config: TranslateConfig, ctx: ExtensionContext)
 		sourceLanguage: config.sourceLanguage,
 		targetLanguage: config.targetLanguage,
 		skipShareThreshold: config.skipShareThreshold,
+		minInputShare: config.minInputShare,
 		maskIdentifiers: config.maskIdentifiers,
 		preserveTerms: config.preserveTerms,
 	};

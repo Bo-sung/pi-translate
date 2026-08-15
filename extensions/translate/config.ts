@@ -69,6 +69,11 @@ export interface TranslateConfig {
 	allowRemoteEndpoint: boolean;
 	/** Source-script share at or above which an answer is treated as already yours. */
 	skipShareThreshold: number;
+	/**
+	 * Minimum source-script share for a prompt to be treated as yours. Below it the text is passed
+	 * through, which is what keeps a machine-injected agent preamble out of the translation model.
+	 */
+	minInputShare: number;
 	/** Mask identifier-shaped tokens so they survive translation verbatim. */
 	maskIdentifiers: boolean;
 	/** Exact strings to keep verbatim, e.g. "Claude Code". */
@@ -91,6 +96,7 @@ export const DEFAULTS: TranslateConfig = {
 	disableWhenOrcaAgent: false,
 	allowRemoteEndpoint: false,
 	skipShareThreshold: 0.2,
+	minInputShare: 0.05,
 	maskIdentifiers: true,
 	preserveTerms: [],
 	ollama: { endpoint: "http://localhost:11434", model: "", timeoutSeconds: 60 },
@@ -148,6 +154,8 @@ export interface OverrideInputs {
 	orcaAgent?: boolean;
 	/** Project config path, when the project is trusted. */
 	projectConfigPath?: string;
+	/** Global config path. Overridable so tests do not read the machine's real configuration. */
+	globalPath?: string;
 }
 
 function parseEnv(value: string | undefined): boolean | undefined {
@@ -163,7 +171,7 @@ function parseEnv(value: string | undefined): boolean | undefined {
 
 /** Global config, overlaid with the project one, then with this run's overrides. */
 export function resolveConfig(overrides: OverrideInputs = {}): ResolvedConfig {
-	let config = merge(DEFAULTS, readJson(globalConfigPath()));
+	let config = merge(DEFAULTS, readJson(overrides.globalPath ?? globalConfigPath()));
 	if (overrides.projectConfigPath) {
 		config = merge(config, readJson(overrides.projectConfigPath));
 	}

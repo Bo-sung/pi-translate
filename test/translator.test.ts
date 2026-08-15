@@ -69,6 +69,45 @@ describe("Translator", () => {
 		assert.ok(masked.includes("code-rules-check"));
 	});
 
+	it("passes through a machine-injected preamble that only mentions your language", async () => {
+		// Regression: Orca injects a 4.7 KB English worker preamble with the Korean task spec appended.
+		// At 1.4% Korean the whole thing was translated, which cost 12 seconds and rewrote the exact
+		// `orca orchestration worker_done` command the preamble tells the worker to run.
+		const preamble = `${"You are a dispatched worker inside Orca. Report with: orca orchestration worker_done --dispatch ctx_1 --outcome succeeded. ".repeat(
+			12,
+		)}Task: docs/spec.ko.md 문서를 읽고 종료 코드 2를 설명해줘.`;
+		const model = recording("should not be used");
+		const outcome = await translator(model.generate).translateWithOutcome(preamble, "sourceToTarget");
+
+		assert.equal(outcome.status, "skipped");
+		assert.deepEqual(model.prompts, []);
+		assert.ok(outcome.text.includes("orca orchestration worker_done"));
+	});
+
+	it("fails instead of delivering a text whose placeholders were mangled", async () => {
+		// Regression: exaone3.5 rewrote every `[[6]]` as `**[6]**`, which silently deleted the masked
+		// spans. A prompt reaching the agent with its commands deleted is worse than no translation.
+		const model = recording("Run the **[0]** command in **[1]** and report.");
+		const outcome = await translator(model.generate).translateWithOutcome(
+			"`worker_done` 명령을 code-rules-check 에서 실행하고 보고해줘.",
+			"sourceToTarget",
+		);
+
+		// The tolerant pattern restores emphasised placeholders rather than dropping them.
+		assert.equal(outcome.status, "translated");
+		assert.ok(outcome.text.includes("`worker_done`"));
+		assert.ok(outcome.text.includes("code-rules-check"));
+
+		// A placeholder the model dropped entirely cannot be recovered, so the original text wins.
+		const lossy = recording("Run the command and report.");
+		const lost = await translator(lossy.generate).translateWithOutcome(
+			"`worker_done` 명령을 실행하고 [[0]] 결과를 보고해줘.",
+			"sourceToTarget",
+		);
+		assert.equal(lost.status, "failed");
+		assert.ok(lost.text.includes("`worker_done`"));
+	});
+
 	it("skips a prompt that is already in the target language without calling the model", async () => {
 		const model = recording("should not be used");
 		const outcome = await translator(model.generate).translateWithOutcome("refactor main() please", "sourceToTarget");
@@ -89,12 +128,15 @@ describe("Translator", () => {
 		assert.equal(outcome.status, "skipped");
 		assert.deepEqual(model.prompts, []);
 
+		// The point is the threshold, not the fidelity of a canned reply: at 0.5 the same answer is no
+		// longer skipped, so it reaches the model and gets re-translated for no benefit.
 		const strict = recording("다시 번역됨");
 		const reTranslated = await translator(strict.generate, { skipShareThreshold: 0.5 }).translateWithOutcome(
 			answer,
 			"targetToSource",
 		);
-		assert.equal(reTranslated.status, "translated");
+		assert.notEqual(reTranslated.status, "skipped");
+		assert.equal(strict.prompts.length, 1);
 	});
 
 	it("still translates an English answer that quotes a Korean name", async () => {

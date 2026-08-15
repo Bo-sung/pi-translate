@@ -111,6 +111,7 @@ All fields live in `translate.json`.
 | `disableWhenOrcaAgent` | `false` | Turn off inside an Orca-launched agent pane |
 | `allowRemoteEndpoint` | `false` | Permit a non-loopback endpoint |
 | `skipShareThreshold` | `0.2` | Source-script share at which an answer counts as already yours |
+| `minInputShare` | `0.05` | Source-script share below which a prompt is treated as machine-generated |
 | `maskIdentifiers` | `true` | Hide identifier-shaped tokens from the translation model |
 | `preserveTerms` | `[]` | Exact strings to keep verbatim, e.g. `"Claude Code"` |
 
@@ -120,6 +121,18 @@ Only the prompt is translated. Tool output, context files and file contents reac
 original language — translating them would corrupt code and cost far more. So when the agent reads a
 Korean document, it answers in Korean, and the output direction degenerates into a same-language round
 trip that mangles names. Pinning the answer language keeps the invariant the design assumes.
+
+### Why `minInputShare` exists
+
+Not everything that reaches the input hook is a prompt you typed. Orca injects a 4.7 KB English
+worker preamble with your task spec appended; at **1.4%** Korean the whole thing was translated,
+which took 12 seconds, rewrote the exact `orca orchestration worker_done` command the preamble tells
+the worker to run, and left the agent producing gibberish. Below `minInputShare` the text is passed
+through untouched. Any real prompt of yours is far above it.
+
+If a translation comes back with a masked span missing — a 7B model rewriting every `[[6]]` as
+`**[6]**`, for instance — the result is discarded and the original text is used. A partially restored
+prompt reaching the agent with its commands deleted is worse than no translation at all.
 
 ### Why `skipShareThreshold` is 0.2
 
